@@ -5,12 +5,14 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, format_err};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_io_timeout::TimeoutStream;
 
 use crate::context::Context;
+use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionStream;
 use crate::net::tls::{SpkiHashStore, TlsSessionStore};
 use crate::sql::Sql;
@@ -260,4 +262,125 @@ pub(crate) async fn connect_tcp(
         .into_iter()
         .map(connect_tcp_inner);
     run_connection_attempts(connection_futures).await
+}
+
+/// Opens a TCP connection to `host` on `port`
+/// through the proxy configured for the context,
+/// or directly if no proxy is enabled.
+///
+/// UIs can use this to tunnel connections of other components,
+/// such as a webview loading map tiles,
+/// through the same proxy as core.
+/// Core does not encrypt the connection,
+/// so the caller should run TLS over it.
+pub async fn connect_tcp_with_proxy(
+    context: &Context,
+    host: &str,
+    port: u16,
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send + 'static> {
+    // Core does not check the TLS of the caller,
+    // so cached DNS results are not used.
+    let load_cache = false;
+    let stream: Box<dyn SessionStream> = match ProxyConfig::load(context).await? {
+        Some(proxy_config) => {
+            proxy_config
+                .connect(context, host, port, load_cache)
+                .await?
+        }
+        None => Box::new(connect_tcp(context, host, port, load_cache).await?),
+    };
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::test_utils::TestContext;
+
+    /// Accepts a single connection on `listener`,
+    /// answers "ping" with "pong"
+    /// and returns what was received before "ping".
+    async fn answer_ping(listener: TcpListener, tunnel_response: &[u8]) -> Result<String> {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = Vec::new();
+        if !tunnel_response.is_empty() {
+            while !received.ends_with(b"\r\n\r\n") {
+                received.push(stream.read_u8().await?);
+            }
+            stream.write_all(tunnel_response).await?;
+        }
+        let mut ping = [0; 4];
+        stream.read_exact(&mut ping).await?;
+        assert_eq!(&ping, b"ping");
+        stream.write_all(b"pong").await?;
+        Ok(String::from_utf8(received)?)
+    }
+
+    async fn ping(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<[u8; 4]> {
+        stream.write_all(b"ping").await?;
+        let mut pong = [0; 4];
+        stream.read_exact(&mut pong).await?;
+        Ok(pong)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_tcp_with_proxy_uses_configured_proxy() -> Result<()> {
+        let t = TestContext::new().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_port = listener.local_addr()?.port();
+        t.set_config(
+            Config::ProxyUrl,
+            Some(&format!("http://127.0.0.1:{proxy_port}")),
+        )
+        .await?;
+        t.set_config_bool(Config::ProxyEnabled, true).await?;
+        let proxy = tokio::spawn(answer_ping(
+            listener,
+            b"HTTP/1.1 200 Connection established\r\n\r\n",
+        ));
+
+        // The proxy resolves the host, so no DNS lookup happens here.
+        let mut stream = connect_tcp_with_proxy(&t, "tiles.example.org", 443).await?;
+        assert_eq!(&ping(&mut stream).await?, b"pong");
+        let request = proxy.await??;
+        assert!(request.starts_with("CONNECT tiles.example.org:443 HTTP/1.1\r\n"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_tcp_with_proxy_without_proxy() -> Result<()> {
+        let t = TestContext::new().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(answer_ping(listener, b""));
+
+        let mut stream = connect_tcp_with_proxy(&t, "127.0.0.1", port).await?;
+        assert_eq!(&ping(&mut stream).await?, b"pong");
+        assert_eq!(server.await??, "");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_tcp_with_proxy_fails_with_unreachable_proxy() -> Result<()> {
+        let t = TestContext::new().await;
+        let target = TcpListener::bind("127.0.0.1:0").await?;
+        let port = target.local_addr()?.port();
+        let proxy = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_port = proxy.local_addr()?.port();
+        drop(proxy);
+        t.set_config(
+            Config::ProxyUrl,
+            Some(&format!("socks5://127.0.0.1:{proxy_port}")),
+        )
+        .await?;
+        t.set_config_bool(Config::ProxyEnabled, true).await?;
+
+        // The target is reachable directly, but the proxy must not be bypassed.
+        assert!(connect_tcp_with_proxy(&t, "127.0.0.1", port).await.is_err());
+        Ok(())
+    }
 }
